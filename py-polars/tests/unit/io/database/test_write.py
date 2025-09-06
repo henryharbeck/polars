@@ -20,13 +20,16 @@ if TYPE_CHECKING:
 
 @pytest.mark.write_disk
 @pytest.mark.parametrize(
-    ("engine", "uri_connection"),
+    ("engine", "uri_connection", "sqlalchemy_object_type"),
     [
-        ("sqlalchemy", True),
-        ("sqlalchemy", False),
+        ("sqlalchemy", True, "engine"),
+        ("sqlalchemy", True, "connection"),
+        ("sqlalchemy", False, "engine"),
+        ("sqlalchemy", False, "connection"),
         pytest.param(
             "adbc",
             True,
+            None,
             marks=pytest.mark.skipif(
                 sys.platform == "win32",
                 reason="adbc not available on Windows",
@@ -35,6 +38,7 @@ if TYPE_CHECKING:
         pytest.param(
             "adbc",
             False,
+            None,
             marks=pytest.mark.skipif(
                 sys.platform == "win32",
                 reason="adbc not available on Windows",
@@ -46,16 +50,30 @@ class TestWriteDatabase:
     """Database write tests that share common pytest/parametrize options."""
 
     @staticmethod
-    def _get_connection(uri: str, engine: DbWriteEngine, uri_connection: bool) -> Any:
+    def _get_connection(
+        uri: str,
+        engine: DbWriteEngine,
+        uri_connection: bool,
+        sqlalchemy_object_type: str | None,
+    ) -> Any:
         if uri_connection:
             return uri
         elif engine == "sqlalchemy":
-            return create_engine(uri)
+            sqlalchemy_engine = create_engine(uri)
+            return (
+                sqlalchemy_engine
+                if sqlalchemy_object_type == "engine"
+                else sqlalchemy_engine.connect()
+            )
         else:
             return _open_adbc_connection(uri)
 
     def test_write_database_create(
-        self, engine: DbWriteEngine, uri_connection: bool, tmp_path: Path
+        self,
+        engine: DbWriteEngine,
+        uri_connection: bool,
+        sqlalchemy_object_type: str | None,
+        tmp_path: Path,
     ) -> None:
         """Test basic database table creation."""
         df = pl.DataFrame(
@@ -69,7 +87,12 @@ class TestWriteDatabase:
         test_db_uri = f"sqlite:///{tmp_path}/test_create_{int(uri_connection)}.db"
 
         table_name = "test_create"
-        conn = self._get_connection(test_db_uri, engine, uri_connection)
+        conn = self._get_connection(
+            test_db_uri,
+            engine,
+            uri_connection,
+            sqlalchemy_object_type,
+        )
 
         assert (
             df.write_database(
@@ -89,7 +112,11 @@ class TestWriteDatabase:
             conn.close()
 
     def test_write_database_append_replace(
-        self, engine: DbWriteEngine, uri_connection: bool, tmp_path: Path
+        self,
+        engine: DbWriteEngine,
+        uri_connection: bool,
+        sqlalchemy_object_type: str | None,
+        tmp_path: Path,
     ) -> None:
         """Test append/replace ops against existing database table."""
         df = pl.DataFrame(
@@ -103,7 +130,12 @@ class TestWriteDatabase:
         test_db_uri = f"sqlite:///{tmp_path}/test_append_{int(uri_connection)}.db"
 
         table_name = "test_append"
-        conn = self._get_connection(test_db_uri, engine, uri_connection)
+        conn = self._get_connection(
+            test_db_uri,
+            engine,
+            uri_connection,
+            sqlalchemy_object_type,
+        )
 
         assert (
             df.write_database(
@@ -158,7 +190,11 @@ class TestWriteDatabase:
             conn.close()
 
     def test_write_database_create_quoted_tablename(
-        self, engine: DbWriteEngine, uri_connection: bool, tmp_path: Path
+        self,
+        engine: DbWriteEngine,
+        uri_connection: bool,
+        sqlalchemy_object_type: str | None,
+        tmp_path: Path,
     ) -> None:
         """Test parsing/handling of quoted database table names."""
         df = pl.DataFrame(
@@ -173,7 +209,12 @@ class TestWriteDatabase:
         # table name has some special chars, so requires quoting, and
         # is explicitly qualified with the sqlite 'main' schema
         qualified_table_name = f'main."test-append-{engine}-{int(uri_connection)}"'
-        conn = self._get_connection(test_db_uri, engine, uri_connection)
+        conn = self._get_connection(
+            test_db_uri,
+            engine,
+            uri_connection,
+            sqlalchemy_object_type,
+        )
 
         assert (
             df.write_database(
@@ -205,7 +246,11 @@ class TestWriteDatabase:
             conn.close()
 
     def test_write_database_errors(
-        self, engine: DbWriteEngine, uri_connection: bool, tmp_path: Path
+        self,
+        engine: DbWriteEngine,
+        uri_connection: bool,
+        sqlalchemy_object_type: str | None,
+        tmp_path: Path,
     ) -> None:
         """Confirm that expected errors are raised."""
         df = pl.DataFrame({"colx": [1, 2, 3]})
@@ -237,7 +282,11 @@ class TestWriteDatabase:
             df.write_database(connection=True, table_name="misc", engine=engine)  # type: ignore[arg-type]
 
     def test_write_database_adbc_missing_driver_error(
-        self, engine: DbWriteEngine, uri_connection: bool, tmp_path: Path
+        self,
+        engine: DbWriteEngine,
+        uri_connection: bool,
+        sqlalchemy_object_type: str | None,
+        tmp_path: Path,
     ) -> None:
         # Skip for sqlalchemy
         if engine == "sqlalchemy":

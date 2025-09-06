@@ -247,6 +247,59 @@ class ExceptionTestParams(NamedTuple):
         pytest.param(
             *DatabaseReadTestParams(
                 read_method="read_database",
+                connect_using=lambda path: create_engine(
+                    f"sqlite:///{path}",
+                    connect_args={"detect_types": sqlite3.PARSE_DECLTYPES},
+                ).connect(),
+                expected_dtypes={
+                    "id": pl.Int64,
+                    "name": pl.String,
+                    "value": pl.Float64,
+                    "date": pl.Date,
+                },
+                expected_dates=[date(2020, 1, 1), date(2021, 12, 31)],
+                batch_size=1,
+            ),
+            id="conn: sqlalchemy (batched)",
+        ),
+        pytest.param(
+            *DatabaseReadTestParams(
+                read_method="read_database",
+                connect_using=lambda path: create_engine(
+                    f"sqlite:///{path}",
+                    connect_args={"detect_types": sqlite3.PARSE_DECLTYPES},
+                ),
+                expected_dtypes={
+                    "id": pl.Int64,
+                    "name": pl.String,
+                    "value": pl.Float64,
+                    "date": pl.Date,
+                },
+                expected_dates=[date(2020, 1, 1), date(2021, 12, 31)],
+            ),
+            id="engine: sqlalchemy",
+        ),
+        pytest.param(
+            *DatabaseReadTestParams(
+                read_method="read_database",
+                connect_using=lambda path: create_engine(
+                    f"sqlite:///{path}",
+                    connect_args={"detect_types": sqlite3.PARSE_DECLTYPES},
+                ),
+                expected_dtypes={
+                    "id": pl.Int64,
+                    "name": pl.String,
+                    "value": pl.Float64,
+                    "date": pl.Date,
+                },
+                expected_dates=[date(2020, 1, 1), date(2021, 12, 31)],
+                batch_size=1,
+            ),
+            id="engine: sqlalchemy (batched)",
+        ),
+        pytest.param(
+            *DatabaseReadTestParams(
+                read_method="read_database",
                 connect_using=adbc_sqlite_connect,
                 expected_dtypes={
                     "id": pl.Int64,
