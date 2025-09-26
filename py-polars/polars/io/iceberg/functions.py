@@ -18,6 +18,7 @@ def scan_iceberg(
     snapshot_id: int | None = None,
     storage_options: dict[str, Any] | None = None,
     reader_override: Literal["native", "pyiceberg"] | None = None,
+    use_metadata_statistics: bool = True,
 ) -> LazyFrame:
     """
     Lazily read from an Apache Iceberg table.
@@ -39,7 +40,9 @@ def scan_iceberg(
     reader_override
         Overrides the reader used to read the data.
 
-        Warning: This parameter is considered unstable, and is subject to change.
+        .. warning::
+            This functionality is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
 
         Note that this parameter should not be necessary outside of testing, as
         polars will by default automatically select the best reader.
@@ -49,6 +52,14 @@ def scan_iceberg(
         * native: Uses polars native reader. This allows for more optimizations to
           improve performance.
         * pyiceberg: Uses PyIceberg, which may support more features.
+    use_metadata_statistics
+        Load and use min/max statistics from Iceberg metadata files when a filter
+        is present. This allows the reader to potentially skip loading metadata
+        from the underlying data files.
+
+        .. warning::
+            This functionality is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
 
     Returns
     -------
@@ -134,6 +145,7 @@ def scan_iceberg(
         snapshot_id=snapshot_id,
         iceberg_storage_properties=storage_options,
         reader_override=reader_override,
+        use_metadata_statistics=use_metadata_statistics,
     )
 
     return wrap_ldf(PyLazyFrame.new_from_dataset_object(dataset))

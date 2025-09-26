@@ -53,8 +53,23 @@ def _get_path_scheme(path: str | Path) -> str | None:
     return path_str[:i] if i >= 0 else None
 
 
-def _is_aws_cloud(scheme: str) -> bool:
-    return any(scheme == x for x in ["s3", "s3a"])
+def _is_aws_cloud(*, scheme: str, first_scan_path: str) -> bool:
+    if any(scheme == x for x in ["s3", "s3a"]):
+        return True
+
+    if scheme == "http" or scheme == "https":
+        bucket_end = first_scan_path.find(".s3.")
+        region_end = first_scan_path.find(".amazonaws.com/", bucket_end + 4)
+
+        if (
+            first_scan_path.find("/", len(scheme) + 3, region_end) > 0
+            or "?" in first_scan_path
+        ):
+            return False
+
+        return 0 < bucket_end < region_end
+
+    return False
 
 
 def _is_azure_cloud(scheme: str) -> bool:

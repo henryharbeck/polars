@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use polars_core::config;
-use polars_core::error::{PolarsError, PolarsResult, polars_bail, to_compute_err};
+use polars_core::error::{PolarsResult, polars_bail, to_compute_err};
 use polars_utils::pl_str::PlSmallStr;
 use polars_utils::plpath::{CloudScheme, PlPath, PlPathRef};
 
@@ -163,9 +163,10 @@ pub fn expanded_from_single_directory(addrs: &[PlPath], expanded_addrs: &[PlPath
 pub fn expand_paths(
     paths: &[PlPath],
     glob: bool,
-    #[allow(unused_variables)] cloud_options: Option<&CloudOptions>,
+    hidden_file_prefix: &[PlSmallStr],
+    #[allow(unused_variables)] cloud_options: &mut Option<CloudOptions>,
 ) -> PolarsResult<Arc<[PlPath]>> {
-    expand_paths_hive(paths, glob, cloud_options, false).map(|x| x.0)
+    expand_paths_hive(paths, glob, hidden_file_prefix, cloud_options, false).map(|x| x.0)
 }
 
 struct HiveIdxTracker<'a> {
@@ -204,7 +205,8 @@ impl HiveIdxTracker<'_> {
 pub fn expand_paths_hive(
     paths: &[PlPath],
     glob: bool,
-    #[allow(unused_variables)] cloud_options: Option<&CloudOptions>,
+    hidden_file_prefix: &[PlSmallStr],
+    #[allow(unused_variables)] cloud_options: &mut Option<CloudOptions>,
     check_directory_level: bool,
 ) -> PolarsResult<(Arc<[PlPath]>, usize)> {
     let Some(first_path) = paths.first() else {
@@ -213,61 +215,22 @@ pub fn expand_paths_hive(
 
     let is_cloud = first_path.as_ref().is_cloud_url();
 
-    /// Wrapper around `Vec<PathBuf>` that also tracks file extensions, so that
-    /// we don't have to traverse the entire list again to validate extensions.
-    struct OutPaths {
-        paths: Vec<PlPath>,
-        exts: [Option<(PlSmallStr, usize)>; 2],
-        current_idx: usize,
-    }
-
-    impl OutPaths {
-        fn update_ext_status(
-            current_idx: &mut usize,
-            exts: &mut [Option<(PlSmallStr, usize)>; 2],
-            value: PlPathRef,
-        ) {
-            let ext = value
-                .extension()
-                .map(PlSmallStr::from)
-                .unwrap_or(PlSmallStr::EMPTY);
-
-            if exts[0].is_none() {
-                exts[0] = Some((ext, *current_idx));
-            } else if exts[1].is_none() && ext != exts[0].as_ref().unwrap().0 {
-                exts[1] = Some((ext, *current_idx));
-            }
-
-            *current_idx += 1;
-        }
-
-        fn push(&mut self, value: PlPath) {
-            {
-                let current_idx = &mut self.current_idx;
-                let exts = &mut self.exts;
-                Self::update_ext_status(current_idx, exts, value.as_ref());
-            }
-            self.paths.push(value)
-        }
-
-        fn extend(&mut self, values: impl IntoIterator<Item = PlPath>) {
-            let current_idx = &mut self.current_idx;
-            let exts = &mut self.exts;
-
-            self.paths.extend(values.into_iter().inspect(|x| {
-                Self::update_ext_status(current_idx, exts, x.as_ref());
-            }))
-        }
-
-        fn extend_from_slice(&mut self, values: &[PlPath]) {
-            self.extend(values.iter().cloned())
-        }
-    }
+    let is_hidden_file = move |path: &PlPath| {
+        path.as_ref()
+            .file_name()
+            .and_then(|x| x.to_str())
+            .is_some_and(|file_name| {
+                hidden_file_prefix
+                    .iter()
+                    .any(|x| file_name.starts_with(x.as_str()))
+            })
+    };
 
     let mut out_paths = OutPaths {
         paths: vec![],
         exts: [None, None],
         current_idx: 0,
+        is_hidden_file: &is_hidden_file,
     };
 
     let mut hive_idx_tracker = HiveIdxTracker {
@@ -398,13 +361,62 @@ pub fn expand_paths_hive(
             };
 
             for (path_idx, path) in paths.iter().enumerate() {
+                use std::borrow::Cow;
+
+                let mut path = Cow::Borrowed(path);
+
                 if matches!(
                     path.cloud_scheme(),
                     Some(CloudScheme::Http | CloudScheme::Https)
                 ) {
-                    out_paths.push(path.clone());
-                    hive_idx_tracker.update(0, path_idx)?;
-                    continue;
+                    let mut rewrite_aws = false;
+
+                    #[cfg(feature = "aws")]
+                    if let Some(p) = (|| {
+                        use crate::cloud::CloudConfig;
+
+                        // See https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html#virtual-hosted-style-access
+                        // Path format: https://bucket-name.s3.region-code.amazonaws.com/key-name
+                        let p = path.as_ref().as_ref();
+                        let after_scheme = p.strip_scheme();
+
+                        let bucket_end = after_scheme.find(".s3.")?;
+                        let offset = bucket_end + 4;
+                        // Search after offset to prevent matching `.s3.amazonaws.com` (legacy global endpoint URL without region).
+                        let region_end = offset + after_scheme[offset..].find(".amazonaws.com/")?;
+
+                        // Do not convert if '?' (this can be query parameters for AWS presigned URLs).
+                        if after_scheme[..region_end].contains('/') || after_scheme.contains('?') {
+                            return None;
+                        }
+
+                        let bucket = &after_scheme[..bucket_end];
+                        let region = &after_scheme[bucket_end + 4..region_end];
+                        let key = &after_scheme[region_end + 15..];
+
+                        if let CloudConfig::Aws(configs) = cloud_options
+                            .get_or_insert_default()
+                            .config
+                            .get_or_insert_with(|| CloudConfig::Aws(Vec::with_capacity(1)))
+                        {
+                            use object_store::aws::AmazonS3ConfigKey;
+
+                            if !matches!(configs.last(), Some((AmazonS3ConfigKey::Region, _))) {
+                                configs.push((AmazonS3ConfigKey::Region, region.into()))
+                            }
+                        }
+
+                        Some(format!("s3://{bucket}/{key}"))
+                    })() {
+                        path = Cow::Owned(PlPath::from_string(p));
+                        rewrite_aws = true;
+                    }
+
+                    if !rewrite_aws {
+                        out_paths.push(path.into_owned());
+                        hive_idx_tracker.update(0, path_idx)?;
+                        continue;
+                    }
                 }
 
                 let glob_start_idx = get_glob_start_idx(path.to_str().as_bytes());
@@ -413,7 +425,7 @@ pub fn expand_paths_hive(
                     path.clone()
                 } else {
                     let (expand_start_idx, paths) =
-                        expand_path_cloud(path.to_str(), cloud_options)?;
+                        expand_path_cloud(path.to_str(), cloud_options.as_ref())?;
                     out_paths.extend_from_slice(&paths);
                     hive_idx_tracker.update(expand_start_idx, path_idx)?;
                     continue;
@@ -422,7 +434,7 @@ pub fn expand_paths_hive(
                 hive_idx_tracker.update(0, path_idx)?;
 
                 let iter = crate::pl_async::get_runtime()
-                    .block_in_place_on(crate::async_glob(path.to_str(), cloud_options))?;
+                    .block_in_place_on(crate::async_glob(path.to_str(), cloud_options.as_ref()))?;
 
                 if is_cloud {
                     out_paths.extend(iter.into_iter().map(PlPath::from_string));
@@ -440,16 +452,16 @@ pub fn expand_paths_hive(
         panic!("Feature `cloud` must be enabled to use globbing patterns with cloud urls.")
     } else {
         let mut stack = VecDeque::new();
+        let mut paths_scratch = vec![];
 
-        for path_idx in 0..paths.len() {
-            let path = paths[path_idx]
-                .as_ref()
-                .as_local_path()
-                .unwrap()
-                .to_path_buf();
+        for (path_idx, path) in paths.iter().enumerate() {
+            let path = path.as_ref();
+            let path = path.as_local_path().unwrap();
             stack.clear();
 
             if path.is_dir() {
+                let path = path.to_path_buf();
+
                 let i = path.to_str().unwrap().len();
 
                 hive_idx_tracker.update(i, path_idx)?;
@@ -457,14 +469,22 @@ pub fn expand_paths_hive(
                 stack.push_back(path.clone());
 
                 while let Some(dir) = stack.pop_front() {
-                    let mut paths = std::fs::read_dir(dir)
-                        .map_err(PolarsError::from)?
-                        .map(|x| x.map(|x| x.path()))
-                        .collect::<std::io::Result<Vec<_>>>()
-                        .map_err(PolarsError::from)?;
-                    paths.sort_unstable();
+                    let mut last_err = Ok(());
 
-                    for path in paths {
+                    paths_scratch.clear();
+                    paths_scratch.extend(std::fs::read_dir(dir)?.map_while(|x| match x {
+                        Ok(v) => Some(v.path()),
+                        Err(e) => {
+                            last_err = Err(e);
+                            None
+                        },
+                    }));
+
+                    last_err?;
+
+                    paths_scratch.sort_unstable();
+
+                    for path in paths_scratch.drain(..) {
                         if path.is_dir() {
                             stack.push_back(path);
                         } else if path.metadata()?.len() > 0 {
@@ -511,7 +531,70 @@ pub fn expand_paths_hive(
         }
     }
 
-    Ok((out_paths.paths.into(), hive_idx_tracker.idx))
+    return Ok((out_paths.paths.into(), hive_idx_tracker.idx));
+
+    /// Wrapper around `Vec<PathBuf>` that also tracks file extensions, so that
+    /// we don't have to traverse the entire list again to validate extensions.
+    struct OutPaths<'a, F: Fn(&PlPath) -> bool> {
+        paths: Vec<PlPath>,
+        exts: [Option<(PlSmallStr, usize)>; 2],
+        current_idx: usize,
+        is_hidden_file: &'a F,
+    }
+
+    impl<F> OutPaths<'_, F>
+    where
+        F: Fn(&PlPath) -> bool,
+    {
+        fn push(&mut self, value: PlPath) {
+            if (self.is_hidden_file)(&value) {
+                return;
+            }
+
+            let current_idx = &mut self.current_idx;
+            let exts = &mut self.exts;
+            Self::update_ext_status(current_idx, exts, value.as_ref());
+
+            self.paths.push(value)
+        }
+
+        fn extend(&mut self, values: impl IntoIterator<Item = PlPath>) {
+            let current_idx = &mut self.current_idx;
+            let exts = &mut self.exts;
+
+            self.paths.extend(
+                values
+                    .into_iter()
+                    .filter(|x| !(self.is_hidden_file)(x))
+                    .inspect(|x| {
+                        Self::update_ext_status(current_idx, exts, x.as_ref());
+                    }),
+            )
+        }
+
+        fn extend_from_slice(&mut self, values: &[PlPath]) {
+            self.extend(values.iter().cloned())
+        }
+
+        fn update_ext_status(
+            current_idx: &mut usize,
+            exts: &mut [Option<(PlSmallStr, usize)>; 2],
+            value: PlPathRef,
+        ) {
+            let ext = value
+                .extension()
+                .map(PlSmallStr::from)
+                .unwrap_or(PlSmallStr::EMPTY);
+
+            if exts[0].is_none() {
+                exts[0] = Some((ext, *current_idx));
+            } else if exts[1].is_none() && ext != exts[0].as_ref().unwrap().0 {
+                exts[1] = Some((ext, *current_idx));
+            }
+
+            *current_idx += 1;
+        }
+    }
 }
 
 /// Ignores errors from `std::fs::create_dir_all` if the directory exists.
@@ -577,7 +660,7 @@ mod tests {
 
         let path = "https://pola.rs/test.csv?token=bear";
         let paths = &[PlPath::new(path)];
-        let out = expand_paths(paths, true, None).unwrap();
+        let out = expand_paths(paths, true, &[], &mut None).unwrap();
         assert_eq!(out.as_ref(), paths);
     }
 }

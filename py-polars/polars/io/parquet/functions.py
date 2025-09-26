@@ -8,6 +8,7 @@ from typing import IO, TYPE_CHECKING, Any
 
 import polars.functions as F
 from polars import concat as plconcat
+from polars._dependencies import import_optional
 from polars._utils.deprecation import (
     deprecate_renamed_parameter,
     issue_deprecation_warning,
@@ -20,7 +21,6 @@ from polars._utils.various import (
 )
 from polars._utils.wrap import wrap_ldf
 from polars.convert import from_arrow
-from polars.dependencies import import_optional
 from polars.io._utils import (
     prepare_file_arg,
 )
@@ -371,7 +371,12 @@ def read_parquet_schema(source: str | Path | IO[bytes] | bytes) -> dict[str, Dat
     return scan_parquet(source).collect_schema()
 
 
-def read_parquet_metadata(source: str | Path | IO[bytes] | bytes) -> dict[str, str]:
+def read_parquet_metadata(
+    source: str | Path | IO[bytes] | bytes,
+    storage_options: dict[str, Any] | None = None,
+    credential_provider: CredentialProviderFunction | Literal["auto"] | None = "auto",
+    retries: int = 2,
+) -> dict[str, str]:
     """
     Get file-level custom metadata of a Parquet file without reading data.
 
@@ -386,6 +391,30 @@ def read_parquet_metadata(source: str | Path | IO[bytes] | bytes) -> dict[str, s
         that have a `read()` method, such as a file handler like the builtin `open`
         function, or a `BytesIO` instance). For file-like objects, the stream position
         may not be updated accordingly after reading.
+    storage_options
+        Options that indicate how to connect to a cloud provider.
+
+        The cloud providers currently supported are AWS, GCP, and Azure.
+        See supported keys here:
+
+        * `aws <https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html>`_
+        * `gcp <https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html>`_
+        * `azure <https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html>`_
+        * Hugging Face (`hf://`): Accepts an API key under the `token` parameter: \
+          `{'token': '...'}`, or by setting the `HF_TOKEN` environment variable.
+
+        If `storage_options` is not provided, Polars will try to infer the information
+        from environment variables.
+    credential_provider
+        Provide a function that can be called to provide cloud storage
+        credentials. The function is expected to return a dictionary of
+        credential keys along with an optional credential expiry time.
+
+        .. warning::
+            This functionality is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
+    retries
+        Number of retries if accessing a cloud instance fails.
 
     Returns
     -------
@@ -395,7 +424,19 @@ def read_parquet_metadata(source: str | Path | IO[bytes] | bytes) -> dict[str, s
     if isinstance(source, (str, Path)):
         source = normalize_filepath(source, check_not_directory=False)
 
-    return _read_parquet_metadata(source)
+    credential_provider_builder = _init_credential_provider_builder(
+        credential_provider, source, storage_options, "scan_parquet"
+    )
+    del credential_provider
+
+    return _read_parquet_metadata(
+        source,
+        storage_options=(
+            list(storage_options.items()) if storage_options is not None else None
+        ),
+        credential_provider=credential_provider_builder,
+        retries=retries,
+    )
 
 
 @deprecate_renamed_parameter("row_count_name", "row_index_name", version="0.20.4")
@@ -410,6 +451,7 @@ def scan_parquet(
     use_statistics: bool = True,
     hive_partitioning: bool | None = None,
     glob: bool = True,
+    hidden_file_prefix: str | Sequence[str] | None = None,
     schema: SchemaDict | None = None,
     hive_schema: SchemaDict | None = None,
     try_parse_hive_dates: bool = True,
@@ -427,6 +469,7 @@ def scan_parquet(
     _column_mapping: ColumnMapping | None = None,
     _default_values: DefaultFieldValues | None = None,
     _deletion_files: DeletionFiles | None = None,
+    _table_statistics: DataFrame | None = None,
 ) -> LazyFrame:
     """
     Lazily read from a local or cloud-hosted parquet file (or files).
@@ -481,6 +524,12 @@ def scan_parquet(
         to prune reads.
     glob
         Expand path given via globbing rules.
+    hidden_file_prefix
+        Skip reading files whose names begin with the specified prefixes.
+
+        .. warning::
+            This functionality is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
     schema
         Specify the datatypes of the columns. The datatypes must match the
         datatypes in the file(s). If there are extra columns that are not in the
@@ -597,6 +646,10 @@ def scan_parquet(
         msg = "The `cast_options` parameter of `scan_parquet` is considered unstable."
         issue_unstable_warning(msg)
 
+    if hidden_file_prefix is not None:
+        msg = "The `hidden_file_prefix` parameter of `scan_parquet` is considered unstable."
+        issue_unstable_warning(msg)
+
     if allow_missing_columns is not None:
         issue_deprecation_warning(
             "the parameter `allow_missing_columns` for `scan_parquet` is deprecated. "
@@ -644,6 +697,11 @@ def scan_parquet(
             missing_columns=missing_columns,
             include_file_paths=include_file_paths,
             glob=glob,
+            hidden_file_prefix=(
+                [hidden_file_prefix]
+                if isinstance(hidden_file_prefix, str)
+                else hidden_file_prefix
+            ),
             hive_partitioning=hive_partitioning,
             hive_schema=hive_schema,
             try_parse_hive_dates=try_parse_hive_dates,
@@ -657,6 +715,7 @@ def scan_parquet(
             column_mapping=_column_mapping,
             default_values=_default_values,
             deletion_files=_deletion_files,
+            table_statistics=_table_statistics,
         ),
     )
 

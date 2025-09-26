@@ -15,6 +15,16 @@ from typing import (
 import polars._reexport as pl
 import polars._utils.construction as plc
 from polars import functions as F
+from polars._dependencies import (
+    _NUMPY_AVAILABLE,
+    _PYARROW_AVAILABLE,
+    _check_for_numpy,
+    _check_for_pandas,
+    dataclasses,
+)
+from polars._dependencies import numpy as np
+from polars._dependencies import pandas as pd
+from polars._dependencies import pyarrow as pa
 from polars._utils.construction.utils import (
     contains_nested,
     get_first_non_none,
@@ -42,16 +52,6 @@ from polars.datatypes import (
     parse_into_dtype,
     try_parse_into_dtype,
 )
-from polars.dependencies import (
-    _NUMPY_AVAILABLE,
-    _PYARROW_AVAILABLE,
-    _check_for_numpy,
-    _check_for_pandas,
-    dataclasses,
-)
-from polars.dependencies import numpy as np
-from polars.dependencies import pandas as pd
-from polars.dependencies import pyarrow as pa
 from polars.exceptions import DataOrientationWarning, ShapeError
 from polars.meta import thread_pool_size
 
@@ -1032,9 +1032,10 @@ def iterable_to_pydf(
         adaptive_chunk_size = None
 
     df: DataFrame = None  # type: ignore[assignment]
-    chunk_size = max(
-        (infer_schema_length or 0),
-        (adaptive_chunk_size or 1000),
+    chunk_size = (
+        None
+        if infer_schema_length is None
+        else max(infer_schema_length, adaptive_chunk_size or 1000)
     )
     while True:
         values = list(islice(data, chunk_size))
